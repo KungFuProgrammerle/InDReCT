@@ -1,0 +1,148 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+# 基础卷积层 + BN + ReLU (改名为 ConvBNReLU2)
+class ConvBNReLU2(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.bn(self.conv(x)))
+
+# 注意力融合层
+class AttentionFusionLayer(nn.Module):
+    def __init__(self, in_dim, num_scales=3):
+        super().__init__()
+        self.num_scales = num_scales
+        self.conv = nn.Conv2d(in_dim * num_scales, in_dim, 3, padding=1)  # 用卷积学习各尺度的融合策略
+
+    def forward(self, list):
+        # 拼接多个尺度的特征图
+        concatenated = torch.cat(list, dim=1)  # 将多个尺度的特征图在通道维度拼接
+
+        # 使用卷积来计算加权特征
+        fused_features = self.conv(concatenated)
+        
+        return fused_features
+
+
+# 特征混合模块
+class MHSIU(nn.Module):
+    def __init__(self, in_dim, num_groups=4, num_zoom=3):
+        super().__init__()
+        self.num_zoom = num_zoom
+        self.conv_l_pre = ConvBNReLU2(in_dim, in_dim, 3, 1, 1)
+        self.conv_s_pre = ConvBNReLU2(in_dim, in_dim, 3, 1, 1)
+
+        self.conv_l = ConvBNReLU2(in_dim, in_dim, 3, 1, 1)  # intra-branch
+        self.conv_m = ConvBNReLU2(in_dim, in_dim, 3, 1, 1)  # intra-branch
+        self.conv_s = ConvBNReLU2(in_dim, in_dim, 3, 1, 1)  # intra-branch
+
+        self.conv_lms = ConvBNReLU2(self.num_zoom * in_dim, 3 * in_dim, 1)  # inter-branch
+        self.initial_merge = ConvBNReLU2(self.num_zoom * in_dim, 3 * in_dim, 1)  # inter-branch
+
+        self.num_groups = num_groups
+        self.trans = nn.Sequential(
+            ConvBNReLU2(3 * in_dim // num_groups, in_dim // num_groups, 1),
+            ConvBNReLU2(in_dim // num_groups, in_dim // num_groups, 3, 1, 1),
+            nn.Conv2d(in_dim // num_groups, 3, 1),
+            nn.Softmax(dim=1),
+        )
+
+        self.attn_self = SelfAttention(in_dim)  # 自注意力
+        self.attn_nonlocal = NonLocalAttention(in_dim)  # 非局部注意力
+
+        self.convList = ConvBNReLU2(in_dim, in_dim, 3, 1, 1)
+        self.attention_fusion = AttentionFusionLayer(in_dim, num_scales=3)  # 使用注意力融合层
+
+    def forward(self, list):
+        tgt_size = list[0].shape[2:]
+        featureList = []
+
+        # 处理每个缩放尺度
+        for i in range(len(list)):
+            l = self.convList(list[i])
+            if l.shape[2:][0] > tgt_size[0]:
+                l = resize_to(l, tgt_hw=tgt_size)
+            elif l.shape[2:][0] < tgt_size[0]:
+                l = F.adaptive_max_pool2d(l, tgt_size) + F.adaptive_avg_pool2d(l, tgt_size)
+            featureList.append(l)
+
+        # 合并多尺度特征
+        lms = torch.cat(featureList, dim=1)  # BT,3C,H,W
+
+        # 应用自注意力和非局部注意力
+        attn_self = self.attn_self(lms)
+        attn_nonlocal = self.attn_nonlocal(lms)
+
+        # 加权合并注意力结果
+        attn = (attn_self + attn_nonlocal) / 2  # 简单加权
+
+        # 转换特征
+        attn = rearrange(attn, "bt (nb ng d) h w -> (bt ng) (nb d) h w", nb=3, ng=self.num_groups)
+        attn = self.trans(attn)  # BTG,3,H,W
+        attn = attn.unsqueeze(dim=2)  # BTG,3,1,H,W
+
+        x = self.initial_merge(lms)
+        x = rearrange(x, "bt (nb ng d) h w -> (bt ng) nb d h w", nb=3, ng=self.num_groups)
+        
+        # 使用注意力融合层进行加权融合
+        x = self.attention_fusion([x, attn])  # 通过注意力融合层加权融合不同尺度的特征图
+
+        # 输出特征
+        x = rearrange(x, "(bt ng) d h w -> bt (ng d) h w", ng=self.num_groups)
+        return x
+
+# 自注意力模块
+class SelfAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 2, 1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 2, 1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch_size, channels, height, width = x.size()
+
+        query = self.query_conv(x).view(batch_size, -1, height * width)  # B, C/2, H*W
+        key = self.key_conv(x).view(batch_size, -1, height * width)  # B, C/2, H*W
+        value = self.value_conv(x).view(batch_size, -1, height * width)  # B, C, H*W
+
+        energy = torch.bmm(query.transpose(1, 2), key)  # B, H*W, H*W
+        attention = F.softmax(energy, dim=-1)  # B, H*W, H*W
+
+        out = torch.bmm(value, attention.transpose(1, 2))  # B, C, H*W
+        out = out.view(batch_size, channels, height, width)
+
+        return self.gamma * out + x  # 返回加权的结果
+
+# 非局部注意力 (Non-local Attention) 模块
+class NonLocalAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 2, 1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 2, 1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch_size, channels, height, width = x.size()
+
+        query = self.query_conv(x).view(batch_size, -1, height * width)  # B, C/2, H*W
+        key = self.key_conv(x).view(batch_size, -1, height * width)  # B, C/2, H*W
+        value = self.value_conv(x).view(batch_size, -1, height * width)  # B, C, H*W
+
+        energy = torch.bmm(query.transpose(1, 2), key)  # B, H*W, H*W
+        attention = F.softmax(energy, dim=-1)  # B, H*W, H*W
+
+        out = torch.bmm(value, attention.transpose(1, 2))  # B, C, H*W
+        out = out.view(batch_size, channels, height, width)
+
+        return self.gamma * out + x  # 返回加权的结果
